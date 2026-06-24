@@ -369,10 +369,86 @@ def build_holdings(rows, base: str) -> tuple:
     return holds, errors
 
 
+def _aggregate_transactions(df, base: str) -> tuple:
+    """Aggregate a broker TRANSACTION export (e.g. Trading 212 / most brokers) into
+    holdings. Sums buys/sells per ticker into a net quantity + weighted-average buy
+    cost. Uses the 'Total' column (already in account currency) for cost, so GBX/USD
+    price quirks don't matter. LSE tickers (GBX/GBP-priced) get a '.L' suffix for Yahoo."""
+    cols = {c: c for c in df.columns}
+    def col(*names):
+        for n in names:
+            if n in cols:
+                return n
+        return None
+    c_act = col("action")
+    c_tk = col("ticker", "symbol")
+    c_sh = col("no. of shares", "no of shares", "shares", "quantity", "qty")
+    c_total = col("total", "total amount")
+    c_pcur = col("currency (price / share)", "currency (price/share)", "price currency")
+    c_pps = col("price / share", "price/share", "price")
+    if not (c_tk and c_sh):
+        raise ValueError("Transaction export needs 'Ticker' and 'No. of shares' columns.")
+
+    agg, errors = {}, []
+    for _, r in df.iterrows():
+        action = str(r.get(c_act, "")).lower()
+        if c_act and not ("buy" in action or "sell" in action):
+            continue  # skip interest, deposits, dividends, fx, etc.
+        raw = str(r.get(c_tk) or "").strip().upper()
+        if not raw or raw == "NAN":
+            continue
+        try:
+            sh = float(r.get(c_sh))
+        except (TypeError, ValueError):
+            continue
+        if sh <= 0:
+            continue
+        # Map to a Yahoo ticker: LSE listings (priced in GBX/GBP) need a ".L" suffix
+        pcur = str(r.get(c_pcur, "") or "").strip().upper()
+        yk = raw if "." in raw else (raw + ".L" if pcur in ("GBX", "GBP") else raw)
+        # Cost of this line in the account/base currency
+        total = None
+        try:
+            total = float(r.get(c_total))
+        except (TypeError, ValueError):
+            try:  # fall back to shares × price/share
+                total = sh * float(r.get(c_pps))
+            except (TypeError, ValueError):
+                total = None
+        a = agg.setdefault(yk, {"net": 0.0, "buy_sh": 0.0, "buy_cost": 0.0})
+        if "sell" in action:
+            a["net"] -= sh
+        else:
+            a["net"] += sh
+            a["buy_sh"] += sh
+            if total is not None:
+                a["buy_cost"] += total
+
+    rows = []
+    for yk, a in agg.items():
+        if a["net"] <= 1e-9:
+            continue  # fully sold out
+        avg = (a["buy_cost"] / a["buy_sh"]) if a["buy_sh"] else 0.0
+        rows.append((yk, a["net"], avg))
+    if not rows:
+        raise ValueError("No open buy positions found in this export.")
+    holds, errs = build_holdings(rows, base)
+    return holds, errors + errs
+
+
 def parse_csv(file, base: str) -> tuple:
-    """Accept flexible column names: ticker/symbol, quantity/qty/shares, avg_cost/cost/price."""
+    """Accept either a simple holdings list (ticker/quantity/avg_cost) OR a broker
+    transaction export (Trading 212 etc. — Action/Ticker/No. of shares/Total)."""
     df = pd.read_csv(file)
     df.columns = [str(c).strip().lower() for c in df.columns]
+    cols = set(df.columns)
+
+    # Broker transaction export? (has an Action column + shares/ticker)
+    if "action" in cols and ("ticker" in cols or "symbol" in cols) and \
+       any(c in cols for c in ("no. of shares", "no of shares", "shares")):
+        return _aggregate_transactions(df, base)
+
+    # Otherwise a simple holdings list
     def pick(*names):
         for n in names:
             if n in df.columns:
@@ -382,8 +458,8 @@ def parse_csv(file, base: str) -> tuple:
     c_qty = pick("quantity", "qty", "shares", "units")
     c_avg = pick("avg_cost", "avg cost", "cost", "price", "avg", "average cost", "avg_price")
     if not (c_tk and c_qty):
-        raise ValueError("CSV needs at least 'ticker' and 'quantity' columns "
-                         "(optional: 'avg_cost').")
+        raise ValueError("CSV needs either 'ticker' + 'quantity' columns, or a broker "
+                         "transaction export (Action / Ticker / No. of shares / Total).")
     rows = []
     for _, r in df.iterrows():
         avg = r[c_avg] if c_avg else 0
@@ -629,7 +705,7 @@ with st.sidebar:
     # ── 1. Load your portfolio ────────────────────────────────────────────────
     st.subheader("1 · Your portfolio")
     src = st.radio("Source", ["Demo portfolio", "Upload CSV", "Enter manually"],
-                   captions=["One-click sample", "ticker, quantity, avg_cost", "Type your holdings"])
+                   captions=["One-click sample", "Holdings list OR broker export", "Type your holdings"])
 
     if src != "Demo portfolio":
         base = st.selectbox("Base currency", ["GBP", "USD", "EUR"],
@@ -645,6 +721,9 @@ with st.sidebar:
     elif src == "Upload CSV":
         st.download_button("⬇ Sample CSV", SAMPLE_CSV, "portfolio_template.csv",
                            "text/csv", use_container_width=True)
+        st.caption("Works with a simple holdings list **or** a broker transaction "
+                   "export (e.g. Trading 212). For a transaction export, use your "
+                   "**full history** — a short date range only captures recent trades.")
         up = st.file_uploader("Upload portfolio CSV", type=["csv"])
         if up is not None and st.button("Load this portfolio", use_container_width=True):
             try:
