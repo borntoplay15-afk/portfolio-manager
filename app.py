@@ -17,6 +17,13 @@ Quant stack:
 import warnings
 warnings.filterwarnings("ignore")
 import io
+import re
+
+try:
+    from pypdf import PdfReader
+    _HAS_PDF = True
+except Exception:
+    _HAS_PDF = False
 
 import numpy as np
 import pandas as pd
@@ -389,6 +396,10 @@ def _aggregate_transactions(df, base: str) -> tuple:
     if not (c_tk and c_sh):
         raise ValueError("Transaction export needs 'Ticker' and 'No. of shares' columns.")
 
+    # UK/LSE account? Then every holding is LSE-listed (incl. USD share classes),
+    # so all tickers need a ".L" Yahoo suffix — not just the GBX/GBP-priced ones.
+    uk = bool(c_pcur and df[c_pcur].astype(str).str.upper().str.contains("GBX").any())
+
     agg, errors = {}, []
     for _, r in df.iterrows():
         action = str(r.get(c_act, "")).lower()
@@ -405,7 +416,7 @@ def _aggregate_transactions(df, base: str) -> tuple:
             continue
         # Map to a Yahoo ticker: LSE listings (priced in GBX/GBP) need a ".L" suffix
         pcur = str(r.get(c_pcur, "") or "").strip().upper()
-        yk = raw if "." in raw else (raw + ".L" if pcur in ("GBX", "GBP") else raw)
+        yk = raw if "." in raw else (raw + ".L" if (uk or pcur in ("GBX", "GBP")) else raw)
         # Cost of this line in the account/base currency
         total = None
         try:
@@ -436,10 +447,11 @@ def _aggregate_transactions(df, base: str) -> tuple:
     return holds, errors + errs
 
 
-def parse_csv(file, base: str) -> tuple:
-    """Accept either a simple holdings list (ticker/quantity/avg_cost) OR a broker
-    transaction export (Trading 212 etc. — Action/Ticker/No. of shares/Total)."""
-    df = pd.read_csv(file)
+def holdings_from_dataframe(df, base: str) -> tuple:
+    """Turn a table (from CSV or Excel) into holdings. Accepts either a simple
+    holdings list (ticker/quantity/avg_cost) OR a broker transaction export
+    (Trading 212 etc. — Action/Ticker/No. of shares/Total)."""
+    df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
     cols = set(df.columns)
 
@@ -454,17 +466,113 @@ def parse_csv(file, base: str) -> tuple:
             if n in df.columns:
                 return n
         return None
-    c_tk = pick("ticker", "symbol", "stock")
-    c_qty = pick("quantity", "qty", "shares", "units")
-    c_avg = pick("avg_cost", "avg cost", "cost", "price", "avg", "average cost", "avg_price")
+    c_tk = pick("ticker", "symbol", "stock", "instrument")
+    c_qty = pick("quantity", "qty", "shares", "units", "no. of shares")
+    c_avg = pick("avg_cost", "avg cost", "cost", "price", "avg", "average cost",
+                 "avg_price", "average price")
     if not (c_tk and c_qty):
-        raise ValueError("CSV needs either 'ticker' + 'quantity' columns, or a broker "
+        raise ValueError("Table needs either 'ticker' + 'quantity' columns, or a broker "
                          "transaction export (Action / Ticker / No. of shares / Total).")
     rows = []
     for _, r in df.iterrows():
         avg = r[c_avg] if c_avg else 0
         rows.append((r[c_tk], r[c_qty], avg))
     return build_holdings(rows, base)
+
+
+def parse_csv(file, base: str) -> tuple:
+    return holdings_from_dataframe(pd.read_csv(file), base)
+
+
+def parse_excel(file, base: str) -> tuple:
+    return holdings_from_dataframe(pd.read_excel(file), base)
+
+
+_ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")        # e.g. GB0009895292
+_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,5}$")    # short ticker token
+
+
+def parse_pdf_text(text: str, base: str) -> tuple:
+    """Best-effort extraction from a broker ACTIVITY STATEMENT PDF. Prefers an
+    'Open positions' table (current quantity + average price); falls back to
+    aggregating an 'executed trades' table. Built/tested on Trading 212; tolerant
+    of similar layouts because it anchors on the ISIN code in each row."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # UK/LSE account? Then every holding is LSE-listed (incl. USD share classes
+    # like HYLD/SXLE), so all tickers need a ".L" Yahoo suffix.
+    uk = bool(re.search(r"\bGBX\b|\bISA\b|London|Trading 212 UK", text, re.I))
+    sec, pos, trades = None, {}, {}
+    for line in lines:
+        low = line.lower()
+        if "open positions" in low and "summary" not in low and "pending" not in low:
+            sec = "pos"; continue
+        if "executed trades" in low:
+            sec = "trades"; continue
+        if any(k in low for k in ("cash breakdown", "transactions and dividends",
+                                  "summary", "pending orders", "dividends")):
+            sec = None; continue
+
+        toks = line.split()
+        idx = next((i for i, t in enumerate(toks) if _ISIN_RE.match(t)), None)
+        if idx is None or idx == 0:
+            continue
+        ticker = toks[idx - 1].upper()
+        if not _TICKER_RE.match(ticker):
+            continue
+        ccy = toks[idx + 1].upper() if idx + 1 < len(toks) else ""
+        is_lse = uk or ccy in ("GBX", "GBP")
+        yk = ticker if "." in ticker else (ticker + ".L" if is_lse else ticker)
+
+        if sec == "pos":
+            try:
+                qty = float(toks[idx + 2]); avg = float(toks[idx + 3])
+            except (IndexError, ValueError):
+                continue
+            pos[yk] = {"qty": qty, "avg": to_base(avg, ccy, base)}
+        elif sec == "trades":
+            d_i = next((i for i, t in enumerate(toks) if t.lower() in ("buy", "sell")), None)
+            if d_i is None:
+                continue
+            try:
+                qty = float(toks[d_i + 1]); price = float(toks[d_i + 2])
+            except (IndexError, ValueError):
+                continue
+            cost = to_base(price, ccy, base)
+            a = trades.setdefault(yk, {"net": 0.0, "bs": 0.0, "bc": 0.0})
+            if toks[d_i].lower() == "sell":
+                a["net"] -= qty
+            else:
+                a["net"] += qty; a["bs"] += qty; a["bc"] += qty * cost
+
+    if pos:
+        rows = [(yk, d["qty"], d["avg"]) for yk, d in pos.items() if d["qty"] > 1e-9]
+        if rows:
+            return build_holdings(rows, base)
+    if trades:
+        rows = [(yk, a["net"], (a["bc"] / a["bs"] if a["bs"] else 0.0))
+                for yk, a in trades.items() if a["net"] > 1e-9]
+        if rows:
+            return build_holdings(rows, base)
+    raise ValueError("Couldn't find an 'Open positions' or trades table in this PDF. "
+                     "Try your broker's CSV export instead.")
+
+
+def parse_pdf(file, base: str) -> tuple:
+    if not _HAS_PDF:
+        raise ValueError("PDF support isn't installed (add 'pypdf' to requirements.txt).")
+    reader = PdfReader(file)
+    text = "\n".join((p.extract_text() or "") for p in reader.pages)
+    return parse_pdf_text(text, base)
+
+
+def parse_upload(file, base: str) -> tuple:
+    """Route an uploaded file to the right parser by extension."""
+    name = (getattr(file, "name", "") or "").lower()
+    if name.endswith(".pdf"):
+        return parse_pdf(file, base)
+    if name.endswith((".xlsx", ".xls")):
+        return parse_excel(file, base)
+    return parse_csv(file, base)   # csv / tsv / txt
 
 
 SAMPLE_CSV = "ticker,quantity,avg_cost\nAAPL,10,180\nMSFT,5,330\nVWRP.L,3,95\nJPM,8,150\n"
@@ -704,8 +812,8 @@ with st.sidebar:
 
     # ── 1. Load your portfolio ────────────────────────────────────────────────
     st.subheader("1 · Your portfolio")
-    src = st.radio("Source", ["Demo portfolio", "Upload CSV", "Enter manually"],
-                   captions=["One-click sample", "Holdings list OR broker export", "Type your holdings"])
+    src = st.radio("Source", ["Demo portfolio", "Upload file", "Enter manually"],
+                   captions=["One-click sample", "CSV · Excel · PDF statement", "Type your holdings"])
 
     if src != "Demo portfolio":
         base = st.selectbox("Base currency", ["GBP", "USD", "EUR"],
@@ -718,16 +826,19 @@ with st.sidebar:
             st.session_state.pf_name = "Demo portfolio"
             st.rerun()
 
-    elif src == "Upload CSV":
+    elif src == "Upload file":
         st.download_button("⬇ Sample CSV", SAMPLE_CSV, "portfolio_template.csv",
                            "text/csv", use_container_width=True)
-        st.caption("Works with a simple holdings list **or** a broker transaction "
-                   "export (e.g. Trading 212). For a transaction export, use your "
-                   "**full history** — a short date range only captures recent trades.")
-        up = st.file_uploader("Upload portfolio CSV", type=["csv"])
+        st.caption("Drop in any of these — the app auto-detects the format:\n"
+                   "• **CSV / Excel** holdings list (ticker, quantity, avg_cost)\n"
+                   "• **Broker transaction export** (e.g. Trading 212) — sums trades into holdings\n"
+                   "• **PDF activity statement** — reads your Open Positions table\n\n"
+                   "For transaction exports, use your **full history** (a short date "
+                   "range only captures recent trades).")
+        up = st.file_uploader("Upload portfolio file", type=["csv", "tsv", "txt", "xlsx", "xls", "pdf"])
         if up is not None and st.button("Load this portfolio", use_container_width=True):
             try:
-                holds, errs = parse_csv(up, base)
+                holds, errs = parse_upload(up, base)
                 if holds:
                     st.session_state.holdings = holds
                     st.session_state.base_ccy = base
