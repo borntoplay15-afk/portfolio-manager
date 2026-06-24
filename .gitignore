@@ -1,0 +1,22 @@
+# PRIVATE — never publish the owner's real portfolio
+_private_holdings.py
+# Notebooks embed the private holdings via build_notebook.mjs — keep them local only
+*.ipynb
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs / runtime
+*.log
+st.log
+cf.log
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
